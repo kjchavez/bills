@@ -99,7 +99,12 @@ def main():
 
     examples = []
     for i, billdir in enumerate(bill_iterator(raw_data_dir, bill_type="s")):
-        x = read_data(billdir)
+        try:
+            x = read_data(billdir)
+        except:
+            logging.warning("Failed to read data for %s", billdir)
+            continue
+
         if i == 0:
             logging.info("Saving schemata of first example to: %s", "schemata.txt")
             with open(os.path.join("schemata.txt"), 'w') as fp:
