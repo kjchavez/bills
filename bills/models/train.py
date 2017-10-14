@@ -2,19 +2,18 @@ import torch
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
-import torchtext
+import torch.nn.functional as F
 
 import collections
 import json
+import logging
 import os
 from os.path import join
+from nltk import tokenize
 
 # In this package.
 from bills.data import vocab
 from bills import consts
-
-project_dir = join(os.path.dirname(__file__), os.pardir, os.pardir)
-PROCESSED_DATA = join(project_dir, "data", "processed")
 
 class BillDataSet(Dataset):
     DOCUMENT = "document.txt"
@@ -50,40 +49,129 @@ def load_vocab(N=10000):
 
     return tokens[0:N]
 
-dset = BillDataSet(PROCESSED_DATA, os.path.join(PROCESSED_DATA, "train.txt"))
-dataloader = DataLoader(dset, batch_size=16, shuffle=True, num_workers=4)
-for i_batch, batch in enumerate(dataloader):
-    print(i_batch)
-    print(batch['status'])
-    break
-
-
 class InputLayer(object):
-    def __init__(self, vocab_file, vocab_size, embedding_dim):
-        # self.vocab = load_vocab(N=vocab_size)
-        self.vocab = vocab.Vocabulary.fromfile(vocab_file)
+    def __init__(self, vocab_file, vocab_size):
+        logging.info("Loading vocabulary...")
+        self.vocab = vocab.BaseVocabulary(vocab_file)
+        assert self.vocab.PAD_ID == 0, "PAD ID is not zero!"
+        logging.info("done.")
         self.trunc_vocab = self.vocab.ordered_tokens()[0:vocab_size]
         self.word2id = {value: idx for idx, value in enumerate(self.trunc_vocab)}
-        self.embedding = torch.nn.Embedding(len(self.trunc_vocab), embedding_dim)
 
-    def embed_id(self, long_tensor):
-        return self.embedding(Variable(long_tensor))
+    def to_long_tensor(self, x):
+        """ Converts batch of document text into LongTensor of shape (batch, M, N) where M is the max
+        number of sentences in the batch and N is the max sentence length.
+        """
+        batch_size = len(x)
+        docs = [[self.vocab.tokenize(self.vocab.normalize(sent))
+                 for sent in tokenize.sent_tokenize(doc)] for doc in x]
+        max_num_sentences = max(len(doc) for doc in docs)
+        max_sent_length = max(len(sent) for doc in docs for sent in doc)
+        ids = torch.LongTensor(batch_size, max_num_sentences, max_sent_length).zero_()
+        for i, doc in enumerate(docs):
+            for j, sent in enumerate(doc):
+                for k, token in enumerate(sent):
+                    ids[i, j, k] = self.word2id.get(token, self.vocab.OOV_ID)
 
-    def embed_tokens(self, tokens):
-        ids = [[self.word2id.get(t, 0) for t in instance] for instance in tokens]
-        return self.embed_id(torch.LongTensor(ids))
+        return ids
+
+def _matrix_dims(size):
+    N = 1
+    for dim in size[0:-1]:
+        N *= dim
+    return (N, size[-1])
+
+class AttentionReduction(torch.nn.Module):
+    def __init__(self, input_dim, attention_dim):
+        super(AttentionReduction, self).__init__()
+        self.linear = torch.nn.Linear(input_dim, attention_dim)
+        self.context = Variable(torch.randn(attention_dim, 1))
+
+    def forward(self, matrix):
+        """
+        Args:
+            matrix:  (N, M, input_dim)
+        """
+        x = F.tanh(self.linear(matrix))
+        logging.debug("After tanh: %s", x.size())
+        y = torch.mm(x.resize(*_matrix_dims(x.size())), self.context).resize(*x.size()[0:-1])
+        logging.debug("After MM with context: %s", y.size())
+        att = F.softmax(y)
+        logging.debug("Att. shape: %s", att.size())
+        att = torch.unsqueeze(att, -1)
+        # element-wise, broadcast multiplication
+        weighted_matrix = matrix * att
+        reduced_vec = torch.sum(weighted_matrix, 1)
+        logging.debug("Reduced vec shape: %s", reduced_vec.size())
+        return reduced_vec
+
+
+class HierarchicalAttention(torch.nn.Module):
+    def __init__(self, embedding_dim, hidden_size, vocab_size, word_attention_dim=16,
+                 sentence_attention_dim=32):
+        super(HierarchicalAttention, self).__init__()
+        # Embedding matrix for tokens.
+        self.embedding = torch.nn.Embedding(vocab_size, embedding_dim)
+
+        # Parameters for creating sentence embeddings
+        self.word_lstm = torch.nn.LSTM(input_size=embedding_dim, hidden_size=hidden_size, num_layers=1,
+                                       bidirectional=True, batch_first=True)
+        # Note, the embedding is going to be 2*hidden_size because we are using a bi-directional
+        # LSTM.
+        self.word_attention = AttentionReduction(2*hidden_size, word_attention_dim)
+
+        # And for creating full document embeddings.
+        self.sent_lstm = torch.nn.LSTM(input_size=2*hidden_size, hidden_size=hidden_size, num_layers=1,
+                                       bidirectional=True, batch_first=True)
+        self.sentence_attention = AttentionReduction(2*hidden_size, sentence_attention_dim)
+
+    def forward(self, x):
+        logging.debug("Input shape: %s", x.size())
+        flat_doc = x.resize(*_matrix_dims(x.size()))
+
+        # How would we embed a single doc?
+        x_embed = self.embedding(flat_doc)
+        hidden, out = self.word_lstm(x_embed)
+        logging.debug("Hidden shape: %s", hidden.size())
+        # Now 'hidden' encodes each of the words in the context of their sentence.
+        # Reduce with an attention mechanism.
+        sentence_embed = self.word_attention(hidden)
+        logging.debug ("Sentence embedding shape: %s", sentence_embed.size())
+
+        # Un-flatten to process sentences now.
+        sentence_embed = sentence_embed.view(x.size()[0], x.size()[1], -1)
+
+        hidden, out = self.sent_lstm(sentence_embed)
+        logging.debug("Sentence encoding shape: %s", hidden.size())
+        doc_embed = self.sentence_attention(hidden)
+        logging.debug("Doc embedding shape: %s", doc_embed.size())
+        return doc_embed
 
 
 def smoke_test():
-    inputs = InputLayer(os.path.join(consts.PROCESSED_DATA_DIR, "vocab.txt"), 100, 50)
-    print(inputs.embedding.weight)
-    ids = torch.LongTensor([[0, 1], [ 6, 9]])
-    x = inputs.embed_id(ids)
-    print(x)
+    logging.basicConfig(level=logging.DEBUG)
+    dset = BillDataSet(consts.PROCESSED_DATA_DIR, os.path.join(consts.PROCESSED_DATA_DIR, "train.txt"))
+    dataloader = DataLoader(dset, batch_size=4, shuffle=True, num_workers=4)
 
-    words = ["for this section".split(), "shall be under".split()]
-    x = inputs.embed_tokens(words)
-    print(x)
+    VOCAB_SIZE = 100
+    WORD_EMBED_DIM = 50
+    HIDDEN_SIZE = 8
+    inputs = InputLayer(os.path.join(consts.PROCESSED_DATA_DIR, "vocab.txt"), VOCAB_SIZE)
+    ha = HierarchicalAttention(WORD_EMBED_DIM, HIDDEN_SIZE, VOCAB_SIZE)
+
+    NUM_CLASSES = 4
+    linear = torch.nn.Linear(HIDDEN_SIZE*2, NUM_CLASSES)
+    for batch in dataloader:
+        x = inputs.to_long_tensor(batch['document'])
+        logging.debug(x.size())
+        out = ha(Variable(x))
+        logging.debug("Output from HA: %s", out)
+        logits = linear(out)
+        probs = F.softmax(logits)
+        loss = F.cross_entropy(logits, batch['status'])
+        logging.info("Loss: %s", loss)
+        break
+
 
 
 #vocab = torchtext.vocab.Vocab(collections.Counter())
