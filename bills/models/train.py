@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
+from torch import optim
 import torch.nn.functional as F
 
 import collections
@@ -21,11 +22,14 @@ def _status_to_class_idx(status):
     else:
         return 0
 
+# TODO(kjchavez): Add some safety constraints here.
+#  * Add absolute maximum bound on document length.
 class BillDataSet(Dataset):
     DOCUMENT = "document.txt"
     LABEL = "label.json"
-    def __init__(self, root_dir, examples_file, transform=None):
+    def __init__(self, root_dir, examples_file, transform=None, max_doc_len=10000):
         self.transform = transform
+        self.max_doc_len = max_doc_len
         with open(examples_file) as fp:
             self.bills = [os.path.join(root_dir, line.strip()) for line in fp]
 
@@ -36,6 +40,10 @@ class BillDataSet(Dataset):
         billdir = self.bills[idx]
         with open(join(billdir, BillDataSet.DOCUMENT)) as fp:
             document = fp.read()
+
+        # Truncate if necessary. Makes sure to only keep whole words.
+        if len(document) > self.max_doc_len:
+            document = document[0:self.max_doc_len].rsplit(' ', 1)[0]
 
         with open(join(billdir, BillDataSet.LABEL)) as fp:
             label = json.load(fp)
@@ -63,7 +71,7 @@ class InputLayer(object):
         self.vocab = vocab.BaseVocabulary(vocab_file)
         assert self.vocab.PAD_ID == 0, "PAD ID is not zero!"
         logging.info("done.")
-        self.trunc_vocab = self.vocab.ordered_tokens()[0:vocab_size]
+        self.trunc_vocab = self.vocab.most_common(vocab_size)
         self.word2id = {value: idx for idx, value in enumerate(self.trunc_vocab)}
 
     def to_long_tensor(self, x):
@@ -124,6 +132,7 @@ class HierarchicalAttention(torch.nn.Module):
         # Parameters for creating sentence embeddings
         self.word_lstm = torch.nn.LSTM(input_size=embedding_dim, hidden_size=hidden_size, num_layers=1,
                                        bidirectional=True, batch_first=True)
+
         # Note, the embedding is going to be 2*hidden_size because we are using a bi-directional
         # LSTM.
         self.word_attention = AttentionReduction(2*hidden_size, word_attention_dim)
@@ -136,9 +145,9 @@ class HierarchicalAttention(torch.nn.Module):
     def forward(self, x):
         logging.debug("Input shape: %s", x.size())
         flat_doc = x.resize(*_matrix_dims(x.size()))
-
-        # How would we embed a single doc?
         x_embed = self.embedding(flat_doc)
+        # NOTE: We shouldn't run the lstm over the whole sequence, since lengths vary.
+        # Use packed/padded utils.
         hidden, out = self.word_lstm(x_embed)
         logging.debug("Hidden shape: %s", hidden.size())
         # Now 'hidden' encodes each of the words in the context of their sentence.
@@ -155,9 +164,20 @@ class HierarchicalAttention(torch.nn.Module):
         logging.debug("Doc embedding shape: %s", doc_embed.size())
         return doc_embed
 
+class DocumentClassifier(torch.nn.Module):
+    def __init__(self, word_embed_dim=50, hidden_size=8, vocab_size=100, num_classes=2):
+        super(DocumentClassifier, self).__init__()
+        self.hier_att = HierarchicalAttention(word_embed_dim, hidden_size, vocab_size)
+        self.linear = torch.nn.Linear(hidden_size*2, num_classes)
+
+    def forward(self, x):
+        logits = self.linear(self.hier_att(x))
+        logging.debug("Logits shape: %s", logits.size())
+        return logits
+
 
 def smoke_test():
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     dset = BillDataSet(consts.PROCESSED_DATA_DIR, os.path.join(consts.PROCESSED_DATA_DIR, "train.txt"))
     dataloader = DataLoader(dset, batch_size=4, shuffle=True, num_workers=4)
 
@@ -165,20 +185,21 @@ def smoke_test():
     WORD_EMBED_DIM = 50
     HIDDEN_SIZE = 8
     inputs = InputLayer(os.path.join(consts.PROCESSED_DATA_DIR, "vocab.txt"), VOCAB_SIZE)
-    ha = HierarchicalAttention(WORD_EMBED_DIM, HIDDEN_SIZE, VOCAB_SIZE)
+    model = DocumentClassifier(word_embed_dim=WORD_EMBED_DIM,
+                              hidden_size=HIDDEN_SIZE,
+                              vocab_size=VOCAB_SIZE)
 
-    NUM_CLASSES = 4
-    linear = torch.nn.Linear(HIDDEN_SIZE*2, NUM_CLASSES)
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9)
     for batch in dataloader:
-        x = inputs.to_long_tensor(batch['document'])
+        x = Variable(inputs.to_long_tensor(batch['document']))
         logging.debug(x.size())
-        out = ha(Variable(x))
-        logging.debug("Output from HA: %s", out)
-        logits = linear(out)
+        logits = model(x)
         probs = F.softmax(logits)
-        print(batch['status'])
-        loss = F.cross_entropy(logits, batch['status'])
+        loss = F.cross_entropy(logits, Variable(batch['label'], requires_grad=False))
         logging.info("Loss: %s", loss)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
 
 if __name__ == "__main__":

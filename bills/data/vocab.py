@@ -57,6 +57,9 @@ class BaseVocabulary(object):
     def ordered_tokens(self):
         return [self.id2word[i] for i in range(len(self.id2word))]
 
+    def most_common(self, n):
+        return self.word2count.most_common(n)
+
     def load(self, filename):
         if not os.path.exists(filename):
             logging.info("Vocab file does not exist. Will create new one.")
