@@ -15,6 +15,12 @@ from nltk import tokenize
 from bills.data import vocab
 from bills import consts
 
+def _status_to_class_idx(status):
+    if status.startswith("ENACTED"):
+        return 1
+    else:
+        return 0
+
 class BillDataSet(Dataset):
     DOCUMENT = "document.txt"
     LABEL = "label.json"
@@ -33,10 +39,12 @@ class BillDataSet(Dataset):
 
         with open(join(billdir, BillDataSet.LABEL)) as fp:
             label = json.load(fp)
-            status = label["status"]
+            status = label['status']
+            class_idx = _status_to_class_idx(label['status'])
 
         sample = {"document": document,
-                  "status": status }
+                  "status": status,
+                  "label": class_idx }
         if self.transform:
             sample = self.transform(sample)
 
@@ -168,12 +176,10 @@ def smoke_test():
         logging.debug("Output from HA: %s", out)
         logits = linear(out)
         probs = F.softmax(logits)
+        print(batch['status'])
         loss = F.cross_entropy(logits, batch['status'])
         logging.info("Loss: %s", loss)
-        break
 
 
-
-#vocab = torchtext.vocab.Vocab(collections.Counter())
-#vocab.load_vectors(torchtext.vocab.pretrained_aliases["glove.6B.50d"])
-smoke_test()
+if __name__ == "__main__":
+    smoke_test()
