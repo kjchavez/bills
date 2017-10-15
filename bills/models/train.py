@@ -101,7 +101,7 @@ class AttentionReduction(torch.nn.Module):
     def __init__(self, input_dim, attention_dim):
         super(AttentionReduction, self).__init__()
         self.linear = torch.nn.Linear(input_dim, attention_dim)
-        self.context = Variable(torch.randn(attention_dim, 1))
+        self.context = torch.nn.Parameter(torch.randn(attention_dim, 1))
 
     def forward(self, matrix):
         """
@@ -131,21 +131,22 @@ class HierarchicalAttention(torch.nn.Module):
 
         # Parameters for creating sentence embeddings
         self.word_lstm = torch.nn.LSTM(input_size=embedding_dim, hidden_size=hidden_size, num_layers=1,
-                                       bidirectional=True, batch_first=True)
+                                       bidirectional=True, batch_first=True).cuda()
 
         # Note, the embedding is going to be 2*hidden_size because we are using a bi-directional
         # LSTM.
-        self.word_attention = AttentionReduction(2*hidden_size, word_attention_dim)
+        self.word_attention = AttentionReduction(2*hidden_size, word_attention_dim).cuda()
 
         # And for creating full document embeddings.
         self.sent_lstm = torch.nn.LSTM(input_size=2*hidden_size, hidden_size=hidden_size, num_layers=1,
-                                       bidirectional=True, batch_first=True)
-        self.sentence_attention = AttentionReduction(2*hidden_size, sentence_attention_dim)
+                                       bidirectional=True, batch_first=True).cuda()
+        self.sentence_attention = AttentionReduction(2*hidden_size, sentence_attention_dim).cuda()
 
     def forward(self, x):
         logging.debug("Input shape: %s", x.size())
         flat_doc = x.resize(*_matrix_dims(x.size()))
         x_embed = self.embedding(flat_doc)
+        x_embed = x_embed.cuda()
         # NOTE: We shouldn't run the lstm over the whole sequence, since lengths vary.
         # Use packed/padded utils.
         hidden, out = self.word_lstm(x_embed)
@@ -168,7 +169,7 @@ class DocumentClassifier(torch.nn.Module):
     def __init__(self, word_embed_dim=50, hidden_size=8, vocab_size=100, num_classes=2):
         super(DocumentClassifier, self).__init__()
         self.hier_att = HierarchicalAttention(word_embed_dim, hidden_size, vocab_size)
-        self.linear = torch.nn.Linear(hidden_size*2, num_classes)
+        self.linear = torch.nn.Linear(hidden_size*2, num_classes).cuda()
 
     def forward(self, x):
         logits = self.linear(self.hier_att(x))
@@ -195,7 +196,8 @@ def smoke_test():
         logging.debug(x.size())
         logits = model(x)
         probs = F.softmax(logits)
-        loss = F.cross_entropy(logits, Variable(batch['label'], requires_grad=False))
+        label = Variable(batch['label'], requires_grad=False).cuda()
+        loss = F.cross_entropy(logits, label)
         logging.info("Loss: %s", loss)
         optimizer.zero_grad()
         loss.backward()
